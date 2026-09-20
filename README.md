@@ -1,216 +1,453 @@
-# RDKV — Reference Implementation (NeurIPS Supplementary)
+# RDKV
 
-Code and reproduction scripts for the  RDKV KV-cache compression method evaluated in the paper.
+Reference implementation for **RDKV**, a rate-distortion based framework for KV-cache compression in long-context LLM inference.
 
-## Repository layout
+RDKV treats KV-cache compression as a **bit-allocation problem** rather than a fixed keep-or-evict decision. The implementation combines:
 
-```
-rdkv/
-├── obkv_fast.py                 # core algorithm: streaming compression + tri-zone scoring + joint eviction
-├── knapsack_solver.py           # per-head budget allocation
-├── obkv_accel/                  # Triton kernels for compressed-cache decoding
-│   ├── fast_decode.py           #   greedy_decode_fast entry point
-│   ├── triton_{k,v}_kernel.py   #   masked attention over packed K/V zones
+* mixed-precision quantization and eviction of **V-cache tokens**;
+* mixed-precision quantization and channel pruning of **K-cache channels**;
+* per-head discrete bit allocation using a Lagrangian solver;
+* empirical quantization-distortion calibration;
+* packed KV-cache storage with fused Triton decoding kernels.
+
+The current repository is research code used for our long-context experiments. It is intended for reproducibility and further research rather than as a production inference library.
+
+---
+
+## Overview
+
+For every transformer layer and KV head, RDKV performs a static compression step during prefill.
+
+The implementation follows the pipeline below:
+
+1. **Importance estimation**
+
+   A recent-query observation window is used to estimate:
+
+   * V-side token importance from attention weights;
+   * K-side channel importance from query/key activation statistics.
+
+2. **Bit allocation**
+
+   Each cache unit is assigned a compression action according to its importance and an empirical quantization-distortion table.
+
+   The discrete allocation is solved using Lagrangian relaxation with one-dimensional bisection.
+
+3. **Packed cache construction**
+
+   Selected KV states are quantized and packed into mixed-precision segments.
+
+   The current packed representation uses:
+
+   * V-cache: 2-bit, 4-bit, 8-bit, and FP16 segments, together with token eviction;
+   * K-cache: channel pruning and 2-bit / 4-bit / 8-bit packed segments.
+
+4. **Compressed decoding**
+
+   Triton kernels consume the packed representation directly during autoregressive decoding, avoiding reconstruction of the entire KV cache in FP16.
+
+The allocation is static during normal decoding. Experimental block-wise decode recompression code is also included.
+
+---
+
+## Repository Structure
+
+```text
+RDKV/
+├── obkv_fast.py
+│   └── main RDKV prefill, scoring, allocation, packing, and inference path
+│
+├── knapsack_solver.py
+│   └── discrete bit-allocation solver
+│
+├── calibrate_epsilon.py
+│   └── quantization-distortion calibration
+│
+├── obkv_accel/
+│   ├── fast_decode.py
+│   ├── packing.py
+│   ├── bitpack.py
+│   ├── triton_k_kernel.py
+│   ├── triton_v_kernel.py
+│   ├── triton_dequant_utils.py
 │   ├── triton_rope.py
 │   ├── triton_rmsnorm.py
-│   ├── triton_dequant_utils.py
 │   ├── trizone_decompress.py
-│   ├── packing.py               #   DualZoneCache + bit-packed layout
-│   ├── bitpack.py
 │   └── decode_hook.py
-├── run_longbench.py / longbench_dataset.py / eval_longbench.py
-├── run_ruler.py     / ruler_dataset.py     / eval_ruler.py
-├── run_infinitebench.py                    / eval_infinitebench.py
+│
+├── run_longbench.py
+├── eval_longbench.py
+├── longbench_dataset.py
+│
+├── run_ruler.py
+├── eval_ruler.py
+├── ruler_dataset.py
+│
+├── run_infinitebench.py
+├── eval_infinitebench.py
+│
 ├── run_niah.py
-├── run_latency.py               # 7-context latency benchmark (TTFT / decode / TPOT / peak mem)
-├── calibrate_epsilon.py         # regenerate per-layer ε(b) for a new backbone
-├── external/LongBench/          # official LongBench v1 scorer (THUDM, MIT) — eval.py + metrics.py used by eval_longbench.py
-├── longbench_manifest/          # 4-shard test manifest used by run_longbench.py
-├── results/                     # per-backbone quantization-distortion calibrations
-│   ├── epsilon_calibration_llama31_8b.json   (= epsilon_calibration_mixed_lengths.json, aliased)
-│   ├── epsilon_calibration_mistral_7b.json
-│   ├── epsilon_calibration_llama2_13b.json
-│   ├── epsilon_calibration_qwen3_4b.json
-│   └── epsilon_calibration_qwen25_72b.json
-└── scripts/                     # 7 reference SLURM scripts (default config)
-    ├── longbench_B1024_pertask_trizone_thinkK_attnlinear.slurm
-    ├── ruler_64k_B1024_pertask_trizone_thinkK_attnlinear.slurm
-    ├── infinitebench_B1024_pertask_trizone_thinkK_attnlinear.slurm
-    ├── niah_B64_B128_streaming_thinkK_attnlin.slurm
-    ├── latency_streaming_7ctx.slurm
-    ├── download_infinitebench.slurm
-    └── generate_ruler_data.slurm
+├── run_latency.py
+│
+├── results/
+│   └── precomputed quantization-distortion calibration files
+│
+├── scripts/
+│   └── reference SLURM scripts
+│
+├── tests/
+│   └── implementation tests
+│
+└── external/LongBench/
+    └── official LongBench evaluation code
 ```
 
-## Default configuration
+Some internal function names, environment variables, and file names still use the prefix `OBKV`, inherited from an earlier prototype. They are part of the current RDKV implementation and will be cleaned up in future releases.
 
-The shipped scripts use the default config reported in the paper:
+---
 
-| Component | Setting | Meaning |
-|---|---|---|
-| `--v-score-type` | `attn_linear` | SnapKV-style linear sum of recent-window attention as the V-token importance score |
-| `--k-score-type` | `think` | "Think-step" K-token importance: K-projected query inner product over the recent window |
-| `--streaming` | on | Compress the prompt in fixed-size streaming chunks during prefill (instead of full prompt → score → evict) |
-| `--eviction-mode` | `joint` | Allocate a joint per-head token budget across all layers via knapsack; evict K and V positions jointly |
-| `--token-budget` | `1024` | Total compressed tokens per head |
-| `--k-budget-ratio` | `0.5` | Half of the budget is spent on K-side surviving positions; the other half feeds the V zones |
-| `--pool-kernel-size` | `5` | Reflective average pool over importance scores before top-k selection |
+## Environment
 
-## Supported backbones and epsilon calibration
+The code has primarily been tested with:
 
-The bit-allocation knapsack consumes a per-bit, per-layer **quantization-distortion calibration ε(b, ℓ)**. We ship calibrations for every backbone reported in the paper:
+* Python 3.11
+* CUDA 12.x
+* NVIDIA A100 / H100 / GH200 GPUs
+* PyTorch 2.4–2.5
+* Hugging Face Transformers 4.55–4.59
+* Triton 3.x
+* FlashAttention-2
 
-| Backbone | Layers | Epsilon file (under `results/`) |
-|---|---|---|
-| `meta-llama/Llama-3.1-8B-Instruct` | 32 | `epsilon_calibration_llama31_8b.json` (also aliased as `epsilon_calibration_mixed_lengths.json`) |
-| `mistralai/Mistral-7B-Instruct-v0.2` | 32 | `epsilon_calibration_mistral_7b.json` |
-| `meta-llama/Llama-2-13b-chat-hf` | 40 | `epsilon_calibration_llama2_13b.json` |
-| `Qwen/Qwen3-4B-Instruct` | 36 | `epsilon_calibration_qwen3_4b.json` |
-| `Qwen/Qwen2.5-72B-Instruct` | 80 | `epsilon_calibration_qwen25_72b.json` |
+A minimal environment can be created with:
 
-Each `scripts/*.slurm` exposes `MODEL_PATH` and `EPSILON_PATH` at the top of the file — swap both together when changing backbones (epsilon is layer-count-specific). Without `--epsilon-path`, `knapsack_solver.py` falls back to a built-in `DEFAULT_EPSILON_K/V` that is conservative but suboptimal.
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
 
-### Calibrating ε for a new backbone
+pip install --upgrade pip
 
-[calibrate_epsilon.py](calibrate_epsilon.py) regenerates the file in ~10 minutes on a single A100. The metric is **layer-wise normalized mean-squared error of fake-quantization** with uniform asymmetric per-axis quantization:
+pip install \
+    "torch>=2.4,<2.6" \
+    "transformers>=4.55,<4.60" \
+    "accelerate>=0.30" \
+    "datasets>=2.18" \
+    "evaluate>=0.4" \
+    "triton>=3.0" \
+    numpy scipy einops sentencepiece protobuf jieba rouge fuzzywuzzy
 
-$$
-\text{NMSE}(b, \ell) \;=\; \frac{\mathbb{E}[(X_{\ell} - \hat{X}_{\ell}^{(b)})^2]}{\text{Var}(X_{\ell})}
-$$
+pip install "flash-attn>=2.6.3" --no-build-isolation
+```
 
-where the inner fake-quantization
+FlashAttention requires a compatible CUDA toolkit and CUDA headers during installation.
 
-$$
-\hat{X} \;=\; s \cdot \big(\,\text{round}(X/s + z) - z\,\big),\quad s = \frac{\max X - \min X}{2^b - 1},\quad z = \text{round}\!\left(-\min X / s\right)
-$$
+The Triton kernels are JIT-compiled on first use and do not require a separate build step.
 
-is applied **per-channel along the seq-len axis** for `K` (`dim=2`) and **per-token along the head-dim axis** for `V` (`dim=3`). Bits 0 and 16 are sentinels (1.0 and 0.0, respectively) — they bracket the knapsack as "fully evicted" and "no quantization." Example:
+---
+
+## Precomputed Quantization Calibration
+
+The discrete allocator uses empirical quantization distortion
+
+```text
+epsilon_K(b)
+epsilon_V(b)
+```
+
+for each supported bit-width.
+
+Precomputed calibration files are provided under `results/`:
+
+```text
+results/
+├── epsilon_calibration_llama31_8b.json
+├── epsilon_calibration_mistral_7b.json
+├── epsilon_calibration_llama2_13b.json
+├── epsilon_calibration_qwen3_4b.json
+└── epsilon_calibration_qwen25_72b.json
+```
+
+These files contain normalized reconstruction-error statistics obtained from fake quantization.
+
+At runtime, RDKV uses model-level aggregated distortion values for:
+
+* per-channel K quantization;
+* per-token V quantization.
+
+The following conventions are used by the allocator:
+
+```text
+epsilon(0)  = 1      # eviction / removal
+epsilon(16) = 0      # full-precision V representation
+```
+
+For K, the current packed implementation uses 2/4/8-bit storage after channel selection.
+
+---
+
+## Calibrating a New Model
+
+`calibrate_epsilon.py` can be used to estimate the quantization-distortion table for a new backbone.
+
+For example:
 
 ```bash
 python calibrate_epsilon.py \
-    --model_name <backbone> \
+    --model_name meta-llama/Llama-3.1-8B-Instruct \
     --data_source ruler \
     --ruler_data_dir /path/to/ruler_data \
     --ruler_lengths 4096,8192,16384,32768,65536,131072 \
     --num_samples_per_length 8 \
-    --output_path results/epsilon_calibration_<backbone_tag>.json
+    --output_path results/epsilon_calibration_new_model.json
 ```
 
-The script also accepts `--data_source longbench` (LongBench `context` field, fast) or `--data_source infinitebench` (long-context tail).
+The script currently supports:
 
-## Environment
-
-Tested on Python **3.11** + CUDA 12.x + 1×A100/H100 (80 GB).
-
-```bash
-python3.11 -m venv .venv && source .venv/bin/activate
-pip install --upgrade pip
-
-pip install \
-  "torch>=2.4,<2.6" \
-  "transformers>=4.55,<4.60" \
-  "accelerate>=0.30" \
-  "datasets>=2.18" \
-  "evaluate>=0.4" \
-  "triton>=3.0" \
-  "flash-attn>=2.6.3" --no-build-isolation \
-  numpy scipy einops sentencepiece protobuf jieba rouge fuzzywuzzy
+```text
+longbench
+ruler
+infinitebench
 ```
 
-`evaluate` is required by [eval_infinitebench.py](eval_infinitebench.py) for ROUGE scoring. The other LongBench / RULER / NIAH scorers are pure-Python and pull `jieba`, `rouge`, `fuzzywuzzy` from the list above.
+as calibration data sources.
 
-`flash-attn` requires CUDA-toolkit headers at build time; on a cluster, load the matching `cuda/` module first and set `CUDA_HOME`.
+---
 
-`obkv_accel/*.py` are JIT-compiled by Triton on first run; no separate build step.
+## LongBench
 
-## Datasets
+LongBench tasks can be run with `run_longbench.py`.
 
-### LongBench
-Loaded on-the-fly from Hugging Face via the shipped dataset script ([longbench_dataset.py](longbench_dataset.py)) — it wraps `THUDM/LongBench`. The first run downloads each task into `~/.cache/huggingface/datasets/`; no manual download.
-
-The 4-shard test manifest in [longbench_manifest/](longbench_manifest/) selects the official test split. The runner expects it under `<repo>/results/longbench/sample_manifests/`:
-
-```bash
-mkdir -p results/longbench/sample_manifests
-ln -s ../../../longbench_manifest/test_num_shards_4_shard_*.json \
-      results/longbench/sample_manifests/
-```
-
-### RULER
-RULER data is generated locally from the upstream NVIDIA repo. Run [scripts/generate_ruler_data.slurm](scripts/generate_ruler_data.slurm) after cloning `https://github.com/NVIDIA/RULER` into `external/RULER` and adjusting the paths inside the script. Output goes to `ruler_data/llama31_8b_instruct/`.
-
-### InfiniteBench
-Run [scripts/download_infinitebench.slurm](scripts/download_infinitebench.slurm) — it pulls the `xinrongzhang2022/InfiniteBench` HF dataset.
-
-### NIAH (Needle-in-a-Haystack)
-Uses Paul Graham essays as the haystack. Either download `https://github.com/gkamradt/LLMTest_NeedleInAHaystack` and point `HAYSTACK_DIR` in the NIAH script at its `PaulGrahamEssays/` folder, or reuse the `niah_*` task data from RULER.
-
-### Latency benchmark
-[run_latency.py](run_latency.py) measures TTFT, decode total, TPOT, and peak memory across 7 contexts (4K → 256K). It feeds synthetic random token IDs of the requested length, so no external dataset download is needed. Run via [scripts/latency_streaming_7ctx.slurm](scripts/latency_streaming_7ctx.slurm) — output is one JSON with per-context timings (median over 3 repeats after 2 warmups).
-
-## Running the scripts
-
-Each `scripts/*.slurm` is a SLURM array job. **Before running, edit the path block at the top of each script** — the shipped values are for the SLURM cluster used in the paper:
-
-```bash
-REPO_ROOT="<REPO_ROOT>"   # → your unzip path's parent
-OBKV_ROOT="${REPO_ROOT}/rdkv"                                  # → directory containing this README
-SCR="<SCRATCH>"            # → fast scratch for results + Triton cache
-EPSILON_PATH="${OBKV_ROOT}/results/epsilon_calibration_mixed_lengths.json"
-```
-
-Also adjust `--model-path` (default `${SCR}/hf_models/Llama-3.1-8B-Instruct`) and the `#SBATCH --account` / `--partition` lines.
-
-Sample submission:
-
-```bash
-cd rdkv
-sbatch scripts/longbench_B1024_pertask_trizone_thinkK_attnlinear.slurm
-sbatch scripts/ruler_64k_B1024_pertask_trizone_thinkK_attnlinear.slurm
-```
-
-Or run a single LongBench task without SLURM:
+Example:
 
 ```bash
 python run_longbench.py \
-  --model-path /path/to/Llama-3.1-8B-Instruct \
-  --token-budget 1024 \
-  --k-budget-ratio 0.5 \
-  --pool-kernel-size 5 \
-  --v-score-type attn_linear \
-  --k-score-type think \
-  --streaming \
-  --eviction-mode joint \
-  --epsilon-path results/epsilon_calibration_mixed_lengths.json \
-  --num-shards 4 --shard 0 \
-  --task narrativeqa \
-  --output-dir /tmp/rdkv_demo
+    --model-path /path/to/Llama-3.1-8B-Instruct \
+    --attn-implementation flash_attention_2 \
+    --device-map single \
+    --task-filter narrativeqa \
+    --token-budget 1024 \
+    --k-budget-ratio 0.5 \
+    --pool-kernel-size 5 \
+    --epsilon-path results/epsilon_calibration_llama31_8b.json \
+    --output-dir ./outputs/longbench/narrativeqa
 ```
 
-Aggregate per-task scores using the official LongBench v1 metrics (ships in [external/LongBench/metrics.py](external/LongBench/metrics.py)):
+Evaluate the generated predictions with:
 
 ```bash
-python eval_longbench.py --pred-dir /tmp/rdkv_demo
+python eval_longbench.py \
+    --pred-dir ./outputs/longbench
 ```
 
-This prints a per-task table (F1 / ROUGE / classification / retrieval / count / code-similarity, per the official `dataset2metric` mapping) plus an arithmetic mean across the tasks present.
+The official LongBench scoring implementation included in `external/LongBench/` is used for evaluation.
 
-For RULER and InfiniteBench, use the matching `eval_ruler.py` / `eval_infinitebench.py`.
+---
 
-## Varying the configuration
+## RULER
 
-To sweep cells in the paper's main results / ablation tables, change the corresponding flag — the same six scripts cover every batch size and backbone:
+RULER data should first be generated using the upstream NVIDIA RULER repository.
 
-| Knob | Flag | Values |
-|---|---|---|
-| Total token budget | `--token-budget` | 32, 64, 128, 256, 512, 1024, 2048 |
-| K/V split | `--k-budget-ratio` | 0.4 – 0.7 |
-| Eviction | `--eviction-mode` | `joint` (default), `topk` |
-| Streaming on/off | `--streaming` | omit the flag for full-prompt scoring |
-| Backbone | `--model-path` | any LLaMA-architecture HF checkpoint |
+A reference SLURM script is provided:
 
-V-side and K-side scoring functions are fixed to the paper's defaults (`--v-score-type attn_linear`, `--k-score-type think`); the corresponding flags accept only those single values.
+```text
+scripts/generate_ruler_data.slurm
+```
 
-## License & attribution
+After generating the dataset:
 
-[external/LongBench/](external/LongBench/) is the official LongBench v1 scorer (MIT, THUDM/LongBench). All other code in this directory is released under the MIT license for review purposes.
+```bash
+python run_ruler.py \
+    --model-path /path/to/Llama-3.1-8B-Instruct \
+    --ruler-data-dir /path/to/ruler_data \
+    --token-budget 1024 \
+    --k-budget-ratio 0.5 \
+    --epsilon-path results/epsilon_calibration_llama31_8b.json \
+    --output-dir ./outputs/ruler
+```
+
+Evaluation is performed with:
+
+```bash
+python eval_ruler.py \
+    --pred-dir ./outputs/ruler
+```
+
+---
+
+## InfiniteBench
+
+InfiniteBench can be evaluated with:
+
+```bash
+python run_infinitebench.py \
+    --model-path /path/to/Llama-3.1-8B-Instruct \
+    --data-dir /path/to/InfiniteBench \
+    --token-budget 1024 \
+    --k-budget-ratio 0.5 \
+    --epsilon-path results/epsilon_calibration_llama31_8b.json \
+    --output-dir ./outputs/infinitebench
+```
+
+A reference download script is included in:
+
+```text
+scripts/download_infinitebench.slurm
+```
+
+---
+
+## Needle-in-a-Haystack
+
+The repository also includes a standard NIAH evaluation:
+
+```bash
+python run_niah.py \
+    --model-path /path/to/Llama-3.1-8B-Instruct \
+    --haystack-dir /path/to/PaulGrahamEssays \
+    --token-budget 128 \
+    --epsilon-path results/epsilon_calibration_llama31_8b.json \
+    --output-dir ./outputs/niah
+```
+
+Paul Graham essays from the commonly used Needle-in-a-Haystack benchmark can be used as the haystack source.
+
+---
+
+## Latency Benchmark
+
+`run_latency.py` evaluates:
+
+* time to first token;
+* total decode time;
+* time per output token;
+* peak GPU memory.
+
+The benchmark uses synthetic input token IDs and therefore does not require an external dataset.
+
+Example:
+
+```bash
+python run_latency.py \
+    --model /path/to/Llama-3.1-8B-Instruct \
+    --context-length 131072 \
+    --num-tokens 1024 \
+    --token-budget 1024
+```
+
+A reference multi-context SLURM script is provided in:
+
+```text
+scripts/latency_streaming_7ctx.slurm
+```
+
+---
+
+## Important Configuration Options
+
+The main options used in the experiments are:
+
+| Option               | Meaning                                                 |
+| -------------------- | ------------------------------------------------------- |
+| `--token-budget`     | FP16-equivalent KV-cache budget                         |
+| `--k-budget-ratio`   | Fraction of the total bit budget allocated to K         |
+| `--pool-kernel-size` | Local smoothing kernel for token importance             |
+| `--epsilon-path`     | Quantization-distortion calibration file                |
+| `--v-bit-options`    | Candidate V-cache bit-widths                            |
+| `--k-bit-options`    | Candidate K-cache bit-widths                            |
+| `--obs-window`       | Number of recent queries used for importance estimation |
+
+The default experimental setting uses:
+
+```text
+observation window = 32
+pooling kernel     = 5
+K/V budget ratio  = 0.5 / 0.5
+```
+
+`--token-budget` is an **FP16-equivalent cache budget**, not the final number of retained tokens.
+
+Because RDKV may retain many low-bit tokens and evict other tokens entirely, the number of surviving tokens is determined automatically by the bit allocator.
+
+---
+
+## SLURM Scripts
+
+Reference cluster scripts are provided under:
+
+```text
+scripts/
+```
+
+Before using them, replace placeholders such as:
+
+```text
+<ACCOUNT>
+<PARTITION>
+<REPO_ROOT>
+<SCRATCH>
+<VENV>
+```
+
+with paths and resource settings for your own cluster.
+
+These scripts are examples rather than portable cluster configurations.
+
+---
+
+## Implementation Notes
+
+This repository reflects the research implementation used during development of RDKV.
+
+A few practical details are worth noting:
+
+* compression is performed layer-by-layer during prefill, after each layer has processed the complete prompt;
+* allocation is performed independently for each KV head;
+* the normal inference path uses a static compressed prompt cache during decoding;
+* K and V use different natural compression granularities: channels for K and tokens for V;
+* V has a dedicated FP16 zone for high-importance tokens;
+* K channels are stored using the current packed 2/4/8-bit representation after pruning;
+* scale and zero-point metadata are stored alongside packed values;
+* several internal symbols still use legacy `OBKV_*` names.
+
+The repository is under active cleanup, so APIs and internal implementation details may change.
+
+---
+
+## Tests
+
+Basic implementation tests are available under:
+
+```text
+tests/
+```
+
+For example:
+
+```bash
+pytest tests/
+```
+
+---
+
+## License and Third-Party Code
+
+RDKV code is released under the MIT License.
+
+The code under:
+
+```text
+external/LongBench/
+```
+
+comes from the official LongBench repository and retains its original MIT license and attribution.
+
+Other external datasets and model checkpoints remain subject to their respective licenses.
+
+---
+
+## Citation
+
+A citation entry will be added together with the public paper release.
+
+For now, if you use this implementation in your research, please refer to the project as:
+
+**RDKV: Rate-Distortion Bit Allocation for KV-Cache Compression**
