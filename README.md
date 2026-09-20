@@ -1,6 +1,6 @@
 # RDKV — Reference Implementation (NeurIPS Supplementary)
 
-Code and reproduction scripts for the OBKV / RDKV KV-cache compression method evaluated in the paper.
+Code and reproduction scripts for the  RDKV KV-cache compression method evaluated in the paper.
 
 ## Repository layout
 
