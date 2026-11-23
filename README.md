@@ -1,6 +1,7 @@
 # RDKV: Rate-Distortion Bit Allocation for Joint Eviction and Quantization of the KV Cache
+[![arXiv](https://img.shields.io/badge/arXiv-2605.08317-b31b1b.svg)](https://arxiv.org/abs/2605.08317)
 
-Official implementation of **RDKV**. Paper: [arXiv:2605.08317](https://arxiv.org/abs/2605.08317)
+Official implementation of **RDKV**.
 
 RDKV treats KV-cache compression for long-context LLM inference as a **bit-allocation problem** instead of a keep-or-evict decision. Each KV head receives a per-unit precision (from eviction to FP16) chosen by a rate-distortion objective, and decoding runs directly on the packed mixed-precision cache.
 
